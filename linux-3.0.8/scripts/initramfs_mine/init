@@ -1,0 +1,118 @@
+#! /bin/sh
+echo "This is /init"
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+#runlevel=S
+#prevlevel=N
+umask 022
+#export PATH runlevel prevlevel
+
+#
+#	Trap CTRL-C &c only in this shell so we can interrupt subprocesses.
+#
+#trap ":" INT QUIT TSTP
+
+/bin/mount -a
+
+echo /sbin/mdev >/proc/sys/kernel/hotplug
+mdev -s
+
+hostname FriendlyARM
+
+exec /sbin/init
+
+#The End
+
+cmdline=`cat /proc/cmdline`
+
+ROOT=none
+ROOTFLAGS=
+ROOTFSTYPE=
+NFSROOT=
+IP=
+INIT=/sbin/init
+
+for x in $cmdline ; do
+	case $x in
+	root=*)
+		ROOT=${x#root=}
+		;;
+	rootfstype=*)
+		ROOTFSTYPE="-t ${x#rootfstype=}"
+		;;
+	rootflags=*)
+		ROOTFLAGS="-o ${x#rootflags=}"
+		;;
+	init=*)
+		INIT=${x#init=}
+		;;
+	nfsroot=*)
+		NFSROOT=${x#nfsroot=}
+		;;
+	ip=*)
+		IP=${x#ip=}
+		;;
+
+	esac
+done
+
+if [ ! -z $NFSROOT ] ; then
+	echo $NFSROOT | sed s/:/\ /g  > /dev/x ;  read sip dir < /dev/x
+	echo $IP | sed s/:/\ /g > /dev/x;  read cip sip2 gip netmask hostname device autoconf < /dev/x
+	rm /dev/x
+	echo $sip $dir $cip $sip2 $gip $netmask $hostname $device $autoconf
+	mount -t nfs $NFSROOT /r -o nolock,proto=tcp
+	#[ -e /r/dev/console ] || exec /bin/sh
+
+elif [ ! -z $run_fs_image ] ; then
+	ROOTFSTYPE="-t ext3"
+	for i in 1 2 3 4 5 ; do
+	/bin/mount -n -o sync -o noatime -o nodiratime -t vfat /dev/mmcblk0p1 /sdcard && break
+	echo Waiting for SD Card...
+	sleep 1
+	done
+	/sbin/losetup /dev/loop0 /sdcard/$run_fs_image
+	/bin/mount $ROOTFSTYPE /dev/loop0 /r
+	mount -o move /sdcard /r/sdcard
+	#/sbin/losetup /dev/loop1 /r/sdcard/swap
+	#/sbin/swapon /dev/loop1
+
+elif [ x${ROOT:0:13} = "x/dev/mmcblk0p" ] ; then
+	for i in 1 2 3 4 5 ; do
+	/bin/mount -n $ROOTFLAGS $ROOTFSTYPE $ROOT /r && break
+	echo Waiting for SD Card...
+	sleep 1
+	done
+else
+	/bin/mount -n $ROOTFLAGS $ROOTFSTYPE $ROOT /r
+fi
+
+ONE_WIRE_PROC=/proc/driver/one-wire-info
+ETC_BASE=/r/etc
+[ -d /r/system/etc ] && ETC_BASE=/r/system/etc
+[ -e $ETC_BASE/ts.detected ] && . $ETC_BASE/ts.detected
+[ -z $CHECK_1WIRE ] && CHECK_1WIRE=Y
+if [ $CHECK_1WIRE = "Y" -a -e $ONE_WIRE_PROC ] ; then
+	if read lcd_type fw_ver tail < $ONE_WIRE_PROC ; then
+		if [ x$lcd_type = "x0" -a x$fw_ver = "x0" ] ; then
+			TS_DEV=/dev/touchscreen
+		else
+			TS_DEV=/dev/touchscreen-1wire
+			echo "1Wire touchscreen OK"
+		fi
+		if [ -e $ETC_BASE/friendlyarm-ts-input.conf ]; then
+			sed "s:^\(TSLIB_TSDEVICE=\).*:\1$TS_DEV:g" $ETC_BASE/friendlyarm-ts-input.conf > $ETC_BASE/ts-autodetect.conf
+			mv $ETC_BASE/ts-autodetect.conf $ETC_BASE/friendlyarm-ts-input.conf -f
+			echo "CHECK_1WIRE=N" > $ETC_BASE/ts.detected
+			sync
+		fi
+	fi
+fi
+
+[ -e /r/etc/friendlyarm-ts-input.conf ] && . /r/etc/friendlyarm-ts-input.conf
+[ -e /r/system/etc/friendlyarm-ts-input.conf ] && . /r/system/etc/friendlyarm-ts-input.conf
+export TSLIB_TSDEVICE
+
+#exec /bin/sh
+
+umount /proc
+exec switch_root /r $INIT </r/dev/console >/r/dev/console 2>&1
