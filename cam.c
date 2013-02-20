@@ -12,16 +12,20 @@
 #include <linux/videodev2.h>
 #include <libv4lconvert.h>
 
-const int scr_width = 800, scr_height = 480, scr_bpp = 32;
+#define NUM_BUF 7
 
+const int scr_width = 800, scr_height = 480, scr_bpp = 32;
 const char *cam_name = "/dev/video3";
 const char *scr_name = "/dev/fb0";
+int page_size;
 
 struct v4l2_capability cap;
 struct v4l2_format fmt, dst_fmt;
 struct v4l2_input input;
 struct v4l2_fmtdesc fmtdesc;
-int fd_cam, fd_scr;
+struct v4l2_requestbuffers reqbuf;
+struct v4l2_buffer buffers[NUM_BUF];
+int fd_cam, fd_scr, buffersize;
 
 void enum_fmt()
 {
@@ -85,14 +89,52 @@ void init_screen()
 	}
 	system("echo 0 >/sys/class/graphics/fbcon/cursor_blink");
 }
+int calc_size(int size)
+{
+	return (size + page_size - 1) & ~(page_size - 1);
+}
+void buf_alloc()
+{
+	int i;
+
+	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	reqbuf.memory = V4L2_MEMORY_USERPTR;
+	reqbuf.count = NUM_BUF;
+	if(ioctl(fd_cam, VIDIOC_REQBUFS, &reqbuf) < 0) {
+		perror("VIDIOC_REQBUFS");
+		exit(1);
+	}
+	printf("buffers: %d\n", reqbuf.count);
+
+	for(i=0; i<NUM_BUF; i++) {
+		
+		if(!(buffers[i].m.userptr = (unsigned long)memalign(page_size, buffersize))) {
+			perror("memalign");
+			exit(1);
+		}
+
+		buffers[i].index = i;
+		buffers[i].type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buffers[i].memory = V4L2_MEMORY_USERPTR;
+		buffers[i].length = buffersize;
+		if(ioctl(fd_cam, VIDIOC_QBUF, &buffers[i]) < 0) {
+			perror("VIDIOC_QBUF");
+			exit(1);
+		}
+	}
+}
 void capture()
 {
 	unsigned int *scr_buf;
-	unsigned char *cam_buf, *dst_buf;
+	unsigned char *dst_buf;
 	int bitmap_size = fmt.fmt.pix.width*fmt.fmt.pix.height*3;
-	int src_size, i, j;
+	int src_size, i, j, k;
 
 	struct v4lconvert_data *lib;
+
+	buffersize = calc_size(fmt.fmt.pix.sizeimage);
+
+	buf_alloc();
 
 	lib = v4lconvert_create(fd_cam);
 	if(!lib) {
@@ -100,9 +142,8 @@ void capture()
 		exit(1);
 	}
 
-	cam_buf = malloc(fmt.fmt.pix.sizeimage);
 	dst_buf = malloc(bitmap_size);
-	if(!cam_buf || !dst_buf){
+	if(!dst_buf){
 		perror("malloc");
 		exit(1);
 	}
@@ -113,34 +154,69 @@ void capture()
 		exit(1);
 	}
 
+	if(ioctl(fd_cam, VIDIOC_STREAMON, &reqbuf.type) < 0) {
+		perror("VIDIOC_STREAMON");
+		exit(1);
+	}
+
 	dst_fmt = fmt;
 	dst_fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_BGR24;
 
-	for(;;) {
-		src_size = read(fd_cam, cam_buf, fmt.fmt.pix.sizeimage);
-		if(src_size <= 0){
-			perror("read");
+	if(!v4lconvert_supported_dst_format(dst_fmt.fmt.pix.pixelformat)){
+		puts("v4lconvert_supported_dst_format");
+		exit(1);
+	}
+
+	for(errno = 0;;) {
+		struct v4l2_buffer cam_buf = {0};
+
+		cam_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		cam_buf.memory = V4L2_MEMORY_USERPTR;
+
+		if(ioctl(fd_cam, VIDIOC_DQBUF, &cam_buf) < 0) {
+			perror("VIDIOC_DQBUF");
 			exit(1);
 		}
 
-		v4lconvert_convert(lib, &fmt, &dst_fmt, cam_buf, src_size, dst_buf, bitmap_size);
+		printf("DQBUF: index=%d, seq=%d, length=%d, time=%d-%d\n", cam_buf.index, cam_buf.sequence, cam_buf.length, cam_buf.timestamp.tv_sec, cam_buf.timestamp.tv_usec);
 
-		for(i = 0; i < fmt.fmt.pix.height; i++)
+		src_size = cam_buf.length;
+
+		if(v4lconvert_convert(lib, &fmt, &dst_fmt, (void*)cam_buf.m.userptr, src_size, dst_buf, bitmap_size) <= 0){
+			perror("v4lconvert_convert");
+			exit(1);
+		}
+
+		cam_buf.length = buffersize;
+		if(ioctl(fd_cam, VIDIOC_QBUF, &cam_buf) < 0) {
+			perror("VIDIOC_QBUF");
+			exit(1);
+		}
+
+		for(i = k = 0; i < fmt.fmt.pix.height; i++)
 			for(j = 0; j < fmt.fmt.pix.width; j++){
-				int k = i*fmt.fmt.pix.width + j;
-				k *= 3; //3 bytes per pixel
-				scr_buf[i*scr_width + j] = (dst_buf[k + 2] << 16)|(dst_buf[k + 1] << 8)|dst_buf[k];
+				scr_buf[i*scr_width + j] = 0xffffff & (*(int*)(&dst_buf[k]));
+				k+=3;
 			}
 	}
 
+	if(ioctl(fd_cam, VIDIOC_STREAMOFF, &reqbuf.type) < 0) {
+		perror("VIDIOC_STREAMOFF");
+		exit(1);
+	}
+
 	munmap(scr_buf, scr_width*scr_height*scr_bpp/8);
-	free(cam_buf);
 	free(dst_buf);
 
 	v4lconvert_destroy(lib);
+
+	for(i=0; i<NUM_BUF; i++)
+		free((void*)buffers[i].m.userptr);
 }
 int main()
 {
+	page_size = sysconf(_SC_PAGESIZE);
+
 	fd_cam = open(cam_name, O_RDWR, 0);
 	fd_scr = open(scr_name, O_RDWR);
 	if(fd_cam < 0 || fd_scr < 0 || errno){
