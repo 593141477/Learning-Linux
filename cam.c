@@ -26,6 +26,7 @@ struct v4l2_fmtdesc fmtdesc;
 struct v4l2_requestbuffers reqbuf;
 struct v4l2_buffer buffers[NUM_BUF];
 int fd_cam, fd_scr, buffersize;
+int *buf_pointer[NUM_BUF];
 
 void enum_fmt()
 {
@@ -93,7 +94,48 @@ int calc_size(int size)
 {
 	return (size + page_size - 1) & ~(page_size - 1);
 }
-void buf_alloc()
+void buf_alloc_mmap()
+{
+	int i;
+
+	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	reqbuf.memory = V4L2_MEMORY_MMAP;
+	reqbuf.count = NUM_BUF;
+	if(ioctl(fd_cam, VIDIOC_REQBUFS, &reqbuf) < 0) {
+		perror("VIDIOC_REQBUFS");
+		exit(1);
+	}
+	printf("buffers: %d\n", reqbuf.count);
+
+	for(i=0; i<reqbuf.count; i++) {
+		
+		buffers[i].index = i;
+		buffers[i].type = reqbuf.type;
+		buffers[i].memory = V4L2_MEMORY_MMAP;
+
+		if(ioctl(fd_cam, VIDIOC_QUERYBUF, &buffers[i]) < 0) {
+			perror("VIDIOC_QUERYBUF");
+			exit(1);
+		}
+
+		if(MAP_FAILED == (buf_pointer[i] = mmap(0, buffers[i].length, PROT_READ|PROT_WRITE, MAP_SHARED, fd_cam, buffers[i].m.offset))) {
+			perror("mmap");
+			exit(1);
+		}
+		
+		if(ioctl(fd_cam, VIDIOC_QBUF, &buffers[i]) < 0) {
+			perror("VIDIOC_QBUF");
+			exit(1);
+		}
+	}
+}
+void free_buf_mmap()
+{
+	int i;
+	for(i=0; i<reqbuf.count; i++)
+		munmap(buf_pointer[i], buffers[i].length);
+}
+void buf_alloc_user_ptr()
 {
 	int i;
 
@@ -106,7 +148,7 @@ void buf_alloc()
 	}
 	printf("buffers: %d\n", reqbuf.count);
 
-	for(i=0; i<NUM_BUF; i++) {
+	for(i=0; i<reqbuf.count; i++) {
 		
 		if(!(buffers[i].m.userptr = (unsigned long)memalign(page_size, buffersize))) {
 			perror("memalign");
@@ -121,7 +163,15 @@ void buf_alloc()
 			perror("VIDIOC_QBUF");
 			exit(1);
 		}
+
+		buf_pointer[i] = (void*)buffers[i].m.userptr;
 	}
+}
+void free_buf_user_ptr()
+{
+	int i;
+	for(i=0; i<reqbuf.count; i++)
+		free((void*)buffers[i].m.userptr);
 }
 void capture()
 {
@@ -134,7 +184,7 @@ void capture()
 
 	buffersize = calc_size(fmt.fmt.pix.sizeimage);
 
-	buf_alloc();
+	buf_alloc_mmap();
 
 	lib = v4lconvert_create(fd_cam);
 	if(!lib) {
@@ -149,7 +199,7 @@ void capture()
 	}
 
 	scr_buf = mmap(0, scr_width*scr_height*scr_bpp/8, PROT_READ|PROT_WRITE, MAP_SHARED, fd_scr, 0);
-	if(scr_buf <= 0) {
+	if(scr_buf == MAP_FAILED) {
 		perror("mmap");
 		exit(1);
 	}
@@ -171,18 +221,18 @@ void capture()
 		struct v4l2_buffer cam_buf = {0};
 
 		cam_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		cam_buf.memory = V4L2_MEMORY_USERPTR;
+		cam_buf.memory = reqbuf.memory;
 
 		if(ioctl(fd_cam, VIDIOC_DQBUF, &cam_buf) < 0) {
 			perror("VIDIOC_DQBUF");
 			exit(1);
 		}
 
-		printf("DQBUF: index=%d, seq=%d, length=%d, time=%d-%d\n", cam_buf.index, cam_buf.sequence, cam_buf.length, cam_buf.timestamp.tv_sec, cam_buf.timestamp.tv_usec);
+		printf("DQBUF: index=%d, seq=%d, time=%d.%06d\n", cam_buf.index, cam_buf.sequence, cam_buf.timestamp.tv_sec, cam_buf.timestamp.tv_usec);
 
 		src_size = cam_buf.length;
 
-		if(v4lconvert_convert(lib, &fmt, &dst_fmt, (void*)cam_buf.m.userptr, src_size, dst_buf, bitmap_size) <= 0){
+		if(v4lconvert_convert(lib, &fmt, &dst_fmt, (void*)buf_pointer[cam_buf.index], src_size, dst_buf, bitmap_size) <= 0){
 			perror("v4lconvert_convert");
 			exit(1);
 		}
@@ -210,8 +260,7 @@ void capture()
 
 	v4lconvert_destroy(lib);
 
-	for(i=0; i<NUM_BUF; i++)
-		free((void*)buffers[i].m.userptr);
+	free_buf_mmap();
 }
 int main()
 {
